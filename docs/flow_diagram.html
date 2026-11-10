@@ -1,0 +1,441 @@
+<title>WM EOD Batch Flow</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one long reading column of numbered levels; pipelines drawn as horizontal lanes that scroll inside their own box. Layer colors follow the medallion (bronze / silver / gold). */
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --ink: #18202b;
+  --muted: #5b6676;
+  --line: #d9dee6;
+  --accent: #2b5fd9;
+  --src: #4b5d73;   --src-bg: #e8edf3;
+  --bronze: #9a5a24; --bronze-bg: #f6e9dc;
+  --silver: #56677a; --silver-bg: #e9eef3;
+  --gold: #8a6a10;  --gold-bg: #f7efd2;
+  --audit: #6a4fb0; --audit-bg: #eee9f8;
+  --sf: #1f78b4;    --sf-bg: #e2f0fa;
+  --orch: #2d7a4f;  --orch-bg: #e3f3ea;
+  --f-display: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
+  --f-body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f141b; --surface: #161d26; --ink: #e6ebf2; --muted: #9aa6b5; --line: #2a3442; --accent: #7aa2ff;
+    --src: #a9b8ca; --src-bg: #1f2935; --bronze: #e0a06a; --bronze-bg: #2c2017; --silver: #b4c2d1; --silver-bg: #1e2733;
+    --gold: #e3c35a; --gold-bg: #2a2412; --audit: #b9a3f0; --audit-bg: #241d36; --sf: #7cc1ee; --sf-bg: #132634;
+    --orch: #7fd2a1; --orch-bg: #142a1e; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f141b; --surface: #161d26; --ink: #e6ebf2; --muted: #9aa6b5; --line: #2a3442; --accent: #7aa2ff;
+  --src: #a9b8ca; --src-bg: #1f2935; --bronze: #e0a06a; --bronze-bg: #2c2017; --silver: #b4c2d1; --silver-bg: #1e2733;
+  --gold: #e3c35a; --gold-bg: #2a2412; --audit: #b9a3f0; --audit-bg: #241d36; --sf: #7cc1ee; --sf-bg: #132634;
+  --orch: #7fd2a1; --orch-bg: #142a1e; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.6 var(--f-body); }
+.wrap { max-width: 1120px; margin: 0 auto; padding-block: 32px 80px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+h1, h2, h3 { font-family: var(--f-display); text-wrap: balance; line-height: 1.2; margin: 0; }
+h1 { font-size: clamp(28px, 4vw, 40px); }
+h2 { font-size: 24px; }
+h3 { font-size: 17px; }
+p { margin: 0; max-width: 68ch; }
+code, .mono { font-family: var(--f-mono); font-size: 0.86em; }
+.lede { color: var(--muted); margin-top: 8px; }
+nav.toc { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
+nav.toc a { font: 500 13px var(--f-body); color: var(--ink); text-decoration: none; border: 1px solid var(--line);
+  background: var(--surface); padding: 6px 12px; border-radius: 999px; }
+nav.toc a:hover, nav.toc a:focus-visible { border-color: var(--accent); color: var(--accent); outline: none; }
+section.level { margin-top: 56px; display: grid; gap: 16px; }
+.eyebrow { font: 600 12px var(--f-mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 16px; font-size: 13px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 12px; height: 12px; border-radius: 3px; display: inline-block; border: 1px solid currentColor; }
+
+/* step list */
+ol.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; counter-reset: s; }
+ol.steps li { counter-increment: s; display: grid; grid-template-columns: 44px 1fr; gap: 14px; align-items: start;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+ol.steps li::before { content: counter(s); font: 700 18px var(--f-display); color: var(--accent);
+  border: 2px solid var(--accent); border-radius: 50%; width: 36px; height: 36px; display: grid; place-items: center; }
+ol.steps li > div { min-width: 0; display: grid; gap: 4px; }
+.cmd { font-family: var(--f-mono); font-size: 13px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+  padding: 2px 8px; justify-self: start; overflow-wrap: anywhere; }
+.where { font-size: 13px; color: var(--muted); }
+
+/* pipeline lanes */
+.lanes-box { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+.lanes { display: flex; gap: 28px; min-width: max-content; align-items: stretch; }
+.lane { display: flex; flex-direction: column; gap: 10px; width: 190px; position: relative; }
+.lane:not(:last-child)::after { content: "→"; position: absolute; right: -22px; top: 50%; transform: translateY(-50%);
+  font: 700 18px var(--f-display); color: var(--muted); }
+.lane-h { font: 600 11px var(--f-mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.lane-body { display: flex; flex-direction: column; gap: 10px; flex: 1; justify-content: center; }
+.node { border: 1.5px solid var(--c); background: var(--cb); border-radius: 8px; padding: 9px 11px; display: grid; gap: 2px; }
+.node b { font: 600 13px var(--f-mono); color: var(--c); overflow-wrap: anywhere; }
+.node small { font-size: 12px; color: var(--muted); line-height: 1.4; }
+.c-src { --c: var(--src); --cb: var(--src-bg); }
+.c-bronze { --c: var(--bronze); --cb: var(--bronze-bg); }
+.c-silver { --c: var(--silver); --cb: var(--silver-bg); }
+.c-gold { --c: var(--gold); --cb: var(--gold-bg); }
+.c-audit { --c: var(--audit); --cb: var(--audit-bg); }
+.c-sf { --c: var(--sf); --cb: var(--sf-bg); }
+.c-orch { --c: var(--orch); --cb: var(--orch-bg); }
+.note { font-size: 13px; color: var(--muted); }
+
+/* code-structure blocks */
+.blocks { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; }
+.block { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px; display: grid; gap: 6px; align-content: start; min-width: 0; }
+.block .tag { font: 600 11px var(--f-mono); color: var(--muted); }
+.block h3 { font-size: 15px; }
+.block p, .block li { font-size: 13.5px; }
+.block ul { margin: 0; padding-left: 18px; display: grid; gap: 2px; }
+
+/* runtime chain */
+.chain { display: grid; gap: 0; }
+.hop { display: grid; grid-template-columns: 160px 1fr; gap: 14px; padding: 12px 0; border-top: 1px dashed var(--line); }
+.hop:first-child { border-top: 0; }
+.hop .who { font: 600 13px var(--f-mono); color: var(--c); }
+.hop .what { min-width: 0; font-size: 14px; }
+
+/* job cards */
+.jobs { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
+.job { background: var(--surface); border: 1px solid var(--line); border-top: 4px solid var(--c); border-radius: 10px;
+  padding: 14px 16px; display: grid; gap: 8px; align-content: start; min-width: 0; }
+.job h3 { font-family: var(--f-mono); font-size: 15px; color: var(--c); overflow-wrap: anywhere; }
+.io { display: grid; grid-template-columns: 56px 1fr; gap: 2px 8px; font-size: 13px; }
+.io dt { color: var(--muted); font: 600 11px var(--f-mono); text-transform: uppercase; letter-spacing: .06em; padding-top: 2px; }
+.io dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.job ol { margin: 0; padding-left: 20px; display: grid; gap: 3px; font-size: 13.5px; }
+
+/* connections table */
+.tbl-box { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+table { border-collapse: collapse; width: 100%; min-width: 760px; font-size: 13.5px; }
+th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font: 600 11px var(--f-mono); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+tr:last-child td { border-bottom: 0; }
+td.mono { white-space: nowrap; }
+
+@media (max-width: 560px) {
+  .hop { grid-template-columns: 1fr; gap: 4px; }
+  ol.steps li { grid-template-columns: 1fr; }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">wm_bigdata_project</div>
+    <h1>WM EOD Batch Flow</h1>
+    <p class="lede">How the wealth-management end-of-day batch works, level by level: building and running it,
+      the Airflow DAG and its file, how a task becomes a Spark job on YARN, what each job script does inside,
+      and where every connection goes.</p>
+    <nav class="toc" aria-label="Levels">
+      <a href="#build">1 · Build and run</a>
+      <a href="#dag">2 · Airflow DAG</a>
+      <a href="#dagfile">3 · DAG file blocks</a>
+      <a href="#runtime">4 · Task → Spark on YARN</a>
+      <a href="#jobs">5 · Job scripts</a>
+      <a href="#data">6 · Data layers</a>
+      <a href="#conn">7 · Connections</a>
+    </nav>
+  </header>
+
+  <!-- ============================== LEVEL 1 -->
+  <section class="level" id="build">
+    <div class="eyebrow">Level 1</div>
+    <h2>How the project is built and run</h2>
+    <p class="note">The order you run things in, from an empty machine to data in Snowflake.</p>
+    <ol class="steps">
+      <li><div><h3>Generate the source data</h3>
+        <span class="cmd">make data</span>
+        <p><code>scripts/generate_data.py</code> writes deterministic fake data: the MySQL CRM seed, NAS feeds for 3 business dates
+          (trades, cash, corporate actions, custodian positions, <code>_SUCCESS</code>), vendor market data, and Kafka event files.
+          Bad rows, corrections, cancels, a stock split and recon breaks are planted on purpose.</p>
+        <span class="where">→ nas/inbound/&lt;date&gt;/ · data/market/ · data/kafka/ · sql/mysql/init/02_seed.sql</span></div></li>
+      <li><div><h3>Package the Spark code</h3>
+        <span class="cmd">make build</span>
+        <p>Zips the <code>wm_pipeline</code> package into <code>dist/wm_pipeline.zip</code> and copies the entry script <code>jobs/run.py</code>.
+          spark-submit ships both to YARN with <code>--py-files</code>.</p>
+        <span class="where">→ dist/ (bind-mounted into the Airflow container)</span></div></li>
+      <li><div><h3>Start the infrastructure</h3>
+        <span class="cmd">make up</span>
+        <p>Starts the aether stack (HDFS, YARN, Hive Metastore, HiveServer2, Spark, Airflow) with this project's override file,
+          which mounts the DAG, package, config, NAS folder and <code>.env</code> into Airflow. Then starts <code>wm-mysql</code>
+          (loads the seed on first start) and <code>wm-kafka</code>, creates the Kafka topic and the Airflow pool <code>wm_yarn</code>.</p>
+        <span class="where">→ docker-compose.yml · docker-compose.airflow-override.yml · network aether-bigdata</span></div></li>
+      <li><div><h3>Simulate the source systems for the day</h3>
+        <span class="cmd">make crm-changes</span> <span class="cmd">make kafka-produce DATE=2026-11-09</span>
+        <p>Applies day-2 CRM changes in MySQL (an advisor leaves, the book is reassigned, a new client opens an account)
+          and publishes the day's intraday OMS trade events to Kafka, keyed by account.</p></div></li>
+      <li><div><h3>Trigger the batch for a business date</h3>
+        <span class="cmd">make trigger DATE=2026-11-09</span>
+        <p>Unpauses <code>wm_eod_batch</code> and starts a run with <code>{"business_date": "2026-11-09"}</code>.
+          On schedule it runs Mon–Fri 22:00 UTC with <code>{{ ds }}</code>.</p></div></li>
+      <li><div><h3>Airflow runs each step as a Spark job on YARN</h3>
+        <p>Sensor → land files in HDFS → bronze (4 sources) → silver → gold → HiveQL reports + reconciliation → Snowflake.
+          See Levels 2–5.</p></div></li>
+      <li><div><h3>Check the results</h3>
+        <span class="cmd">scripts/dag_status.sh</span> <span class="cmd">make status</span> <span class="cmd">make yarn-logs JOB=…</span> <span class="cmd">make beeline</span>
+        <p>Task states, the run_control table and failed DQ checks, the driver log of any job, and SQL on the Hive tables.</p></div></li>
+      <li><div><h3>Serve from Snowflake</h3>
+        <span class="cmd">make snowflake-setup</span>
+        <p>Creates <code>WM_DB.GOLD</code> once. With <code>WM_SNOWFLAKE_ENABLED=true</code> every run publishes the gold marts,
+          and you query them in Snowsight.</p></div></li>
+    </ol>
+  </section>
+
+  <!-- ============================== LEVEL 2 -->
+  <section class="level" id="dag">
+    <div class="eyebrow">Level 2</div>
+    <h2>The Airflow DAG <code>wm_eod_batch</code></h2>
+    <div class="legend">
+      <span class="c-orch"><i class="sw" style="background:var(--orch-bg)"></i>Airflow only</span>
+      <span class="c-bronze"><i class="sw" style="background:var(--bronze-bg)"></i>Bronze job</span>
+      <span class="c-silver"><i class="sw" style="background:var(--silver-bg)"></i>Silver job</span>
+      <span class="c-gold"><i class="sw" style="background:var(--gold-bg)"></i>Gold job</span>
+      <span class="c-audit"><i class="sw" style="background:var(--audit-bg)"></i>Control / audit</span>
+      <span class="c-sf"><i class="sw" style="background:var(--sf-bg)"></i>Snowflake</span>
+    </div>
+    <div class="lanes-box" role="figure" aria-label="DAG tasks from left to right">
+      <div class="lanes">
+        <div class="lane"><div class="lane-h">Step 1 · Gate</div><div class="lane-body">
+          <div class="node c-orch"><b>wait_for_nas_feed</b><small>PythonSensor, waits for _SUCCESS on the NAS</small></div>
+          <div class="node c-audit"><b>ensure_catalog</b><small>Spark: create Hive + Iceberg tables if missing</small></div>
+        </div></div>
+        <div class="lane"><div class="lane-h">Step 2 · Land</div><div class="lane-body">
+          <div class="node c-orch"><b>land_to_hdfs</b><small>NAS files → HDFS landing over WebHDFS</small></div>
+        </div></div>
+        <div class="lane"><div class="lane-h">Step 3 · Bronze</div><div class="lane-body">
+          <div class="node c-bronze"><b>bronze_nas_files</b><small>CSV, pipe file, JSON → Hive</small></div>
+          <div class="node c-bronze"><b>bronze_crm_jdbc</b><small>MySQL over JDBC, watermark</small></div>
+          <div class="node c-bronze"><b>bronze_market</b><small>S3 (or HDFS) vendor data</small></div>
+          <div class="node c-bronze"><b>bronze_trades_stream</b><small>Kafka, Structured Streaming</small></div>
+        </div></div>
+        <div class="lane"><div class="lane-h">Step 4 · Silver</div><div class="lane-body">
+          <div class="node c-silver"><b>silver_reference</b><small>SCD1 dims, SCD2 accounts, prices</small></div>
+          <div class="node c-silver"><b>silver_transactions</b><small>validate, dedup, MERGE trades/cash</small></div>
+        </div></div>
+        <div class="lane"><div class="lane-h">Step 5 · Gold</div><div class="lane-body">
+          <div class="node c-gold"><b>gold_book_of_record</b><small>FIFO lots, positions, P&amp;L, cash, valuation</small></div>
+        </div></div>
+        <div class="lane"><div class="lane-h">Step 6 · Report + recon</div><div class="lane-body">
+          <div class="node c-gold"><b>gold_reporting</b><small>HiveQL: advisor book, client summary</small></div>
+          <div class="node c-audit"><b>middle_office_recon</b><small>books vs custodian breaks</small></div>
+        </div></div>
+        <div class="lane"><div class="lane-h">Step 7 · Publish</div><div class="lane-body">
+          <div class="node c-sf"><b>publish_snowflake</b><small>gold → WM_DB.GOLD (skips if disabled)</small></div>
+        </div></div>
+        <div class="lane"><div class="lane-h">Step 8 · Done</div><div class="lane-body">
+          <div class="node c-orch"><b>batch_complete</b><small>EmptyOperator, none_failed</small></div>
+        </div></div>
+      </div>
+    </div>
+    <p class="note">Exact dependencies: the sensor gates landing; <code>bronze_nas_files</code> and <code>bronze_market</code> need landing + catalog;
+      <code>bronze_crm_jdbc</code> and <code>bronze_trades_stream</code> need only the catalog; <code>silver_reference</code> needs CRM + market;
+      <code>silver_transactions</code> needs silver_reference + NAS files + stream. Every Spark task uses pool <code>wm_yarn</code> (1 slot),
+      so YARN runs one Spark app at a time on its 4 GB node, while the graph still shows which steps are independent.</p>
+  </section>
+
+  <!-- ============================== LEVEL 3 -->
+  <section class="level" id="dagfile">
+    <div class="eyebrow">Level 3</div>
+    <h2>Main blocks of <code>airflow/dags/wm_eod_batch_dag.py</code></h2>
+    <p class="note">Top to bottom, in the order they appear in the file.</p>
+    <div class="blocks">
+      <div class="block"><span class="tag">block 1</span><h3>Imports and constants</h3>
+        <p>Paths inside the container (NAS, market, <code>dist/</code>, <code>pipeline.json</code>), the WebHDFS URL, the Maven
+          <code>PACKAGES</code> per connector (mysql, kafka, s3, snowflake), pool name, and the
+          <code>BUSINESS_DATE</code> template: <code>dag_run.conf.business_date</code> or <code>ds</code>.</p></div>
+      <div class="block"><span class="tag">block 2</span><h3><code>aws_env()</code></h3>
+        <p>Reads the default profile from the mounted <code>~/.aws/credentials</code>, only when the market source is S3.</p></div>
+      <div class="block"><span class="tag">block 3</span><h3><code>spark_submit()</code></h3>
+        <ul><li>builds <code>spark-submit --master yarn --deploy-mode cluster</code></li>
+          <li>adds memory, <code>--py-files</code> zip, <code>--files</code> config/key</li>
+          <li>adds <code>--packages</code> and extra <code>--conf</code></li>
+          <li>passes secrets as <code>${VAR}</code> env to driver + executors</li>
+          <li>streams output to the task log, fails on non-zero exit</li></ul></div>
+      <div class="block"><span class="tag">block 4</span><h3><code>webhdfs()</code> · <code>put_file()</code></h3>
+        <p>Two-step WebHDFS upload: the NameNode answers 307 with a DataNode URL, then the file body goes there.</p></div>
+      <div class="block"><span class="tag">block 5</span><h3><code>default_args</code> and <code>@dag(...)</code></h3>
+        <p>Owner, 1 retry after 2 min, 30 min task timeout. Schedule <code>0 22 * * 1-5</code>, no catchup, one active run,
+          paused on creation, 3 h run timeout.</p></div>
+      <div class="block"><span class="tag">block 6</span><h3><code>wait_for_nas_feed</code></h3>
+        <p>PythonSensor in <code>reschedule</code> mode: checks for <code>_SUCCESS</code> every 60 s for up to 2 h, freeing the worker slot between checks.</p></div>
+      <div class="block"><span class="tag">block 7</span><h3><code>land_to_hdfs</code> task</h3>
+        <p>Uploads every NAS file for the date to <code>/data/wm/landing/nas/&lt;date&gt;/</code>. In <code>hdfs</code> market mode it also lands the vendor files.</p></div>
+      <div class="block"><span class="tag">block 8</span><h3><code>spark_task()</code> factory</h3>
+        <p>Turns a job name into a TaskFlow task in pool <code>wm_yarn</code> that calls <code>spark_submit(job, business_date)</code>. Used for 8 of the tasks.</p></div>
+      <div class="block"><span class="tag">block 9</span><h3>Tasks with special inputs</h3>
+        <ul><li><code>bronze_crm_jdbc</code>: MySQL user/password env + JDBC driver</li>
+          <li><code>bronze_market</code>: S3 keys, region endpoint, hadoop-aws</li>
+          <li><code>publish_snowflake</code>: skips unless enabled; ships the private key file</li></ul></div>
+      <div class="block"><span class="tag">block 10</span><h3>Dependency wiring</h3>
+        <p>The <code>&gt;&gt;</code> lines at the bottom create the graph in Level 2.</p></div>
+    </div>
+  </section>
+
+  <!-- ============================== LEVEL 4 -->
+  <section class="level" id="runtime">
+    <div class="eyebrow">Level 4</div>
+    <h2>What happens when one task runs</h2>
+    <p class="note">Example: <code>silver_transactions</code> for 2026-11-09. Every Spark task follows the same path.</p>
+    <div class="block chain">
+      <div class="hop c-orch"><div class="who">Airflow scheduler</div><div class="what">Pool slot free → runs the task, which calls <code>spark_submit("silver_transactions", "2026-11-09")</code>.</div></div>
+      <div class="hop c-orch"><div class="who">spark-submit client</div><div class="what">Uploads <code>run.py</code>, <code>wm_pipeline.zip</code>, <code>pipeline.json</code> and any packages to HDFS staging, then asks YARN for an application.</div></div>
+      <div class="hop c-audit"><div class="who">YARN ResourceManager</div><div class="what">Starts the ApplicationMaster container on the NodeManager. In cluster mode the Spark <b>driver</b> runs inside it, then executors get their own containers.</div></div>
+      <div class="hop c-silver"><div class="who">jobs/run.py</div><div class="what">Parses <code>--job --business-date --option</code>, then <code>importlib</code> loads <code>wm_pipeline.jobs.silver_transactions</code> and calls <code>run(args)</code>.</div></div>
+      <div class="hop c-silver"><div class="who">make_context()</div><div class="what"><code>load_config()</code> reads <code>pipeline.json</code>; <code>build_spark()</code> creates the SparkSession with Hive support, UTC time zone, AQE, dynamic partition overwrite, corrected date parsing.</div></div>
+      <div class="hop c-silver"><div class="who">with ctx.audit():</div><div class="what">The job body runs: read tables → transform (<code>wm_pipeline/transforms</code>) → write with <code>insert_overwrite()</code> or Iceberg <code>MERGE</code> → DQ checks.</div></div>
+      <div class="hop c-audit"><div class="who">Audit on exit</div><div class="what">Writes one row to <code>wm_audit.run_control</code> (SUCCESS or FAILED, row counts, metrics). DQ results go to <code>wm_audit.dq_results</code>; a CRITICAL failure raises.</div></div>
+      <div class="hop c-orch"><div class="who">Back in Airflow</div><div class="what">spark-submit exits 0 or non-zero → task success, or retry once after 2 min.</div></div>
+    </div>
+  </section>
+
+  <!-- ============================== LEVEL 5 -->
+  <section class="level" id="jobs">
+    <div class="eyebrow">Level 5</div>
+    <h2>Main blocks of each job script</h2>
+    <p class="note">Files under <code>wm_pipeline/jobs/</code>, in DAG order. Each runs inside <code>with ctx.audit():</code>.</p>
+    <div class="jobs">
+      <article class="job c-audit"><h3>setup_catalog.py</h3>
+        <dl class="io"><dt>reads</dt><dd>resources/hive/01_bronze.hql, 02_gold_audit.hql, iceberg/01_silver.sql</dd><dt>writes</dt><dd>Hive Metastore definitions</dd></dl>
+        <ol><li>Load each SQL file from inside the zip</li><li>Split into statements, run each with <code>spark.sql</code></li><li>All <code>IF NOT EXISTS</code>, so it is safe every run</li></ol></article>
+
+      <article class="job c-bronze"><h3>bronze_nas_files.py</h3>
+        <dl class="io"><dt>reads</dt><dd>HDFS /data/wm/landing/nas/&lt;date&gt;/</dd><dt>writes</dt><dd>wm_bronze.trades_raw, cash_activity_raw, custodian_positions_raw, corporate_actions_raw</dd></dl>
+        <ol><li><code>csv()</code> helper: explicit schema, PERMISSIVE, <code>_corrupt_record</code></li>
+          <li>Four feeds: trades CSV, cash <code>|</code> file with MM/dd/yyyy, custodian CSV, corporate actions JSON</li>
+          <li>Add audit columns: source file, load time, batch id</li>
+          <li>Overwrite the <code>business_date</code> partition; count rows and malformed rows</li></ol></article>
+
+      <article class="job c-bronze"><h3>bronze_crm_jdbc.py</h3>
+        <dl class="io"><dt>reads</dt><dd>MySQL wm_crm: branch, financial_advisor, party, account</dd><dt>writes</dt><dd>wm_bronze.crm_*_raw, lake.wm_audit.jdbc_watermark</dd></dl>
+        <ol><li>Per table: previous high watermark − 60 min overlap</li>
+          <li>Min/max id query for the bounds</li>
+          <li>Parallel JDBC read: partitionColumn, 4 partitions, fetchsize</li>
+          <li>Overwrite the <code>extract_date</code> partition</li>
+          <li>MERGE the new watermark only after the write</li></ol></article>
+
+      <article class="job c-bronze"><h3>bronze_market.py</h3>
+        <dl class="io"><dt>reads</dt><dd>s3a://bucket/wm/market/ or HDFS landing/market</dd><dt>writes</dt><dd>wm_bronze.security_master_raw, prices_raw</dd></dl>
+        <ol><li><code>market_base()</code> picks S3 or HDFS from <code>WM_MARKET_SOURCE</code></li>
+          <li>Security master CSV with a schema</li>
+          <li>Prices JSON, <code>price_date=</code> partitions, last 10 days</li>
+          <li>Warn if today's prices are missing</li></ol></article>
+
+      <article class="job c-bronze"><h3>bronze_trades_stream.py</h3>
+        <dl class="io"><dt>reads</dt><dd>Kafka topic wm.intraday.trades</dd><dt>writes</dt><dd>wm_bronze.trades_stream_raw, HDFS checkpoint</dd></dl>
+        <ol><li><code>readStream</code> from Kafka, earliest, max offsets per trigger</li>
+          <li><code>from_json</code> on the value, keep partition/offset</li>
+          <li><code>foreachBatch</code> appends each micro-batch to Hive</li>
+          <li><code>trigger(availableNow=True)</code>: catch up, then stop</li></ol></article>
+
+      <article class="job c-silver"><h3>silver_reference.py</h3>
+        <dl class="io"><dt>reads</dt><dd>bronze CRM, security master, prices</dd><dt>writes</dt><dd>lake.wm_silver.dim_branch, dim_financial_advisor, dim_party, dim_account, dim_security, fact_price</dd></dl>
+        <ol><li>Latest row per key (overlap window can repeat keys)</li>
+          <li>SCD1 MERGE on row-hash change; party e-mail masked</li>
+          <li>SCD2 accounts: hash, effective_from, <code>stage_scd2()</code>, one MERGE closes + inserts</li>
+          <li>Prices MERGE on (security, date)</li>
+          <li>DQ: one current row per account, FA exists, unique CUSIP</li></ol></article>
+
+      <article class="job c-silver"><h3>silver_transactions.py</h3>
+        <dl class="io"><dt>reads</dt><dd>bronze trades file + stream, cash, corporate actions; silver dims</dd><dt>writes</dt><dd>fact_trade, fact_cash_activity, ref_corporate_action, quarantine</dd></dl>
+        <ol><li>Union file + stream by name, drop exact duplicates</li>
+          <li><code>validate_trades()</code>: malformed, missing keys, orphan account, unknown security</li>
+          <li><code>latest_trade_versions()</code>: highest version, file beats stream</li>
+          <li>MERGE trades; cash and corporate actions (flatten nested terms)</li>
+          <li>Quarantine with reasons; row-count reconciliation; DQ</li></ol></article>
+
+      <article class="job c-gold"><h3>gold_book_of_record.py</h3>
+        <dl class="io"><dt>reads</dt><dd>silver facts and dims, as of the business date</dd><dt>writes</dt><dd>wm_gold.tax_lots_open, positions_daily, realized_gains, cash_balances_daily, account_valuation_daily</dd></dl>
+        <ol><li>Accounts valid on the date (SCD2 as-of join)</li>
+          <li><code>split_adjust()</code> trades, then <code>lot_ledger()</code> running-quantity axes</li>
+          <li>Latest close with <code>max_by</code>, broadcast</li>
+          <li>Open FIFO lots → positions → realized YTD with short/long term</li>
+          <li>Cash on trade-date and settle-date basis (running sum)</li>
+          <li>Account valuation with asset-class pivot and estimated tax; DQ</li></ol></article>
+
+      <article class="job c-gold"><h3>gold_reporting.py</h3>
+        <dl class="io"><dt>reads</dt><dd>wm_gold.account_valuation_daily</dd><dt>writes</dt><dd>wm_gold.advisor_book_daily, client_portfolio_summary</dd></dl>
+        <ol><li><code>SET hivevar:as_of_date</code></li>
+          <li>Run <code>resources/hive/gold_reporting.hql</code> (also runs in beeline)</li>
+          <li>Advisor book: FA, branch, region, firm levels with DENSE_RANK</li>
+          <li>Client summary: allocation %, segment, NTILE decile</li></ol></article>
+
+      <article class="job c-audit"><h3>middle_office_recon.py</h3>
+        <dl class="io"><dt>reads</dt><dd>gold positions, bronze custodian positions</dd><dt>writes</dt><dd>wm_audit.recon_breaks, dq_results</dd></dl>
+        <ol><li>Map both sides to account number + CUSIP</li>
+          <li>Full outer join, classify: QTY_MISMATCH, MISSING_AT_CUSTODIAN, MISSING_IN_BOOKS</li>
+          <li>Fill internal ids for ops; fail only on an abnormal break rate</li></ol></article>
+
+      <article class="job c-sf"><h3>publish_snowflake.py</h3>
+        <dl class="io"><dt>reads</dt><dd>5 gold tables for the date</dd><dt>writes</dt><dd>WM_DB.GOLD.* in Snowflake</dd></dl>
+        <ol><li>Key-pair options from env + shipped key file</li>
+          <li>Per table: <code>DELETE</code> the date as a preaction, then append</li>
+          <li>Snowflake connector stages and runs COPY INTO</li></ol></article>
+    </div>
+  </section>
+
+  <!-- ============================== LEVEL 6 -->
+  <section class="level" id="data">
+    <div class="eyebrow">Level 6</div>
+    <h2>Where the data lands, layer by layer</h2>
+    <div class="lanes-box" role="figure" aria-label="Data layers from sources to Snowflake">
+      <div class="lanes">
+        <div class="lane"><div class="lane-h">Sources</div><div class="lane-body">
+          <div class="node c-src"><b>NAS folder</b><small>trades, cash, corporate actions, custodian positions</small></div>
+          <div class="node c-src"><b>MySQL wm_crm</b><small>branch, advisor, party, account</small></div>
+          <div class="node c-src"><b>S3 vendor</b><small>security master, prices</small></div>
+          <div class="node c-src"><b>Kafka</b><small>intraday OMS trades</small></div>
+        </div></div>
+        <div class="lane"><div class="lane-h">Bronze · Hive Parquet</div><div class="lane-body">
+          <div class="node c-bronze"><b>wm_bronze.*_raw</b><small>11 external tables, raw + audit columns, one partition per date</small></div>
+        </div></div>
+        <div class="lane"><div class="lane-h">Silver · Iceberg</div><div class="lane-body">
+          <div class="node c-silver"><b>dims</b><small>dim_account (SCD2), dim_party, dim_financial_advisor, dim_branch, dim_security</small></div>
+          <div class="node c-silver"><b>facts</b><small>fact_trade, fact_cash_activity, fact_price, ref_corporate_action</small></div>
+          <div class="node c-silver"><b>quarantine</b><small>rejected rows + reason</small></div>
+        </div></div>
+        <div class="lane"><div class="lane-h">Gold · Hive Parquet</div><div class="lane-body">
+          <div class="node c-gold"><b>books</b><small>positions_daily, tax_lots_open, realized_gains, cash_balances_daily, account_valuation_daily</small></div>
+          <div class="node c-gold"><b>reports</b><small>advisor_book_daily, client_portfolio_summary</small></div>
+        </div></div>
+        <div class="lane"><div class="lane-h">Serving</div><div class="lane-body">
+          <div class="node c-sf"><b>Snowflake WM_DB.GOLD</b><small>POSITIONS_DAILY, ACCOUNT_VALUATION_DAILY, ADVISOR_BOOK_DAILY, CLIENT_PORTFOLIO_SUMMARY, REALIZED_GAINS</small></div>
+        </div></div>
+      </div>
+    </div>
+    <div class="node c-audit"><b>wm_audit (written by every layer)</b><small>run_control · dq_results · recon_breaks · jdbc_watermark (Iceberg)</small></div>
+  </section>
+
+  <!-- ============================== LEVEL 7 -->
+  <section class="level" id="conn">
+    <div class="eyebrow">Level 7</div>
+    <h2>Every connection</h2>
+    <div class="tbl-box">
+      <table>
+        <thead><tr><th>From</th><th>To</th><th>Address</th><th>Protocol</th><th>Credentials</th><th>Used by</th></tr></thead>
+        <tbody>
+          <tr><td>Airflow</td><td>HDFS NameNode</td><td class="mono">namenode:9870</td><td>WebHDFS (HTTP)</td><td>user.name=root</td><td>land_to_hdfs</td></tr>
+          <tr><td>Airflow</td><td>YARN ResourceManager</td><td class="mono">resourcemanager:8032</td><td>spark-submit</td><td>HADOOP_CONF_DIR</td><td>every Spark task</td></tr>
+          <tr><td>Spark</td><td>HDFS</td><td class="mono">namenode:8020</td><td>HDFS RPC</td><td>root</td><td>all reads and writes</td></tr>
+          <tr><td>Spark</td><td>Hive Metastore</td><td class="mono">hive-metastore:9083</td><td>Thrift</td><td>none (dev)</td><td>Hive + Iceberg catalog</td></tr>
+          <tr><td>Spark</td><td>MySQL</td><td class="mono">wm-mysql:3306</td><td>JDBC</td><td>WM_MYSQL_USER / PASSWORD from .env</td><td>bronze_crm_jdbc</td></tr>
+          <tr><td>Spark</td><td>Kafka</td><td class="mono">wm-kafka:9092</td><td>Kafka</td><td>none (dev)</td><td>bronze_trades_stream</td></tr>
+          <tr><td>Spark</td><td>Amazon S3</td><td class="mono">s3a://&lt;bucket&gt;/wm/market</td><td>HTTPS (s3a)</td><td>~/.aws default profile</td><td>bronze_market (when WM_MARKET_SOURCE=s3)</td></tr>
+          <tr><td>Spark</td><td>Snowflake</td><td class="mono">&lt;account&gt;.snowflakecomputing.com</td><td>HTTPS</td><td>key pair, ~/.snowflake/rsa_key.p8</td><td>publish_snowflake</td></tr>
+          <tr><td>You</td><td>Airflow UI</td><td class="mono">localhost:8080</td><td>HTTP</td><td>admin</td><td>trigger, watch runs</td></tr>
+          <tr><td>You</td><td>YARN UI / History</td><td class="mono">localhost:8088 · 19888</td><td>HTTP</td><td>none</td><td>apps, logs</td></tr>
+          <tr><td>You</td><td>HiveServer2</td><td class="mono">localhost:10000</td><td>JDBC (beeline)</td><td>none</td><td>make beeline, make status</td></tr>
+          <tr><td>You</td><td>MySQL · Kafka</td><td class="mono">localhost:3306 · 29092</td><td>MySQL · Kafka</td><td>.env</td><td>inspect sources</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">MySQL and Kafka join the <code>aether-bigdata</code> Docker network, so the Spark driver and executors inside YARN containers reach them by hostname.</p>
+  </section>
+</div>
