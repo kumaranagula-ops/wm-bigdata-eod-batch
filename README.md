@@ -113,6 +113,30 @@ Unit tests (pytest, local SparkSession, inside the cluster image):
 make test
 ```
 
+## Verified results (full runs on the Docker cluster, 2026-11-10)
+
+All three business dates ran end to end on YARN, then published to Snowflake.
+
+| Check | 2026-11-06 | 2026-11-09 | 2026-11-10 |
+|---|---|---|---|
+| Positions (Hive = Snowflake) | 11,515 | 11,666 | 11,808 |
+| Accounts valued | 2,300 | 2,301 | 2,301 |
+| Firm AUM | $1.289B | $1.290B | |
+| Recon breaks | 5 (all planted) | 5 (all planted) | 5 (all planted) |
+| Quarantined rows | 6 | 9 | 9 |
+
+- **Idempotent**: 11-06 ran twice and gave identical results (21,275 trades = 21,275 distinct IDs, bronze not doubled).
+- **Silver row count reconciles**: in = merged + rejected + duplicates + superseded versions.
+- **Kafka**: 306 events, 304 distinct; the end-of-day file version wins over the stream.
+- **SCD2**: 2,380 account versions, 2,321 current. FA 9040's book stays with FA 9040 for 11-06 and moves to FA 9012 from 11-09.
+- **2-for-1 split on SEC00001**: quantity doubled, price halved, cost basis unchanged. Recon still matches the custodian.
+- **Snowflake**: all 15 table/date counts in `WM_DB.GOLD` equal Hive gold.
+
+Bugs found by the first real run (good interview stories):
+- `13/45/2026` raised `SparkUpgradeException` instead of becoming NULL. Fixed with `spark.sql.legacy.timeParserPolicy=CORRECTED`.
+- `F.nullif` failed on an unresolved column in PySpark 3.5. Replaced with `when`.
+- Recreating the `dist/` folder left the Airflow bind mount empty. `make build` now replaces files in place.
+
 ## Layout
 
 ```
