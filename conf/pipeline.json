@@ -1,0 +1,51 @@
+{
+  "_comment": "Non-secret pipeline settings. Shipped to YARN with --files; secrets come from environment variables (see .env). Kept as JSON because the cluster's Python has no PyYAML.",
+  "hdfs": {
+    "landing_nas": "hdfs://namenode:8020/data/wm/landing/nas",
+    "landing_market": "hdfs://namenode:8020/data/wm/landing/market",
+    "checkpoints": "hdfs://namenode:8020/data/wm/checkpoints"
+  },
+  "databases": {
+    "bronze": "wm_bronze",
+    "silver": "lake.wm_silver",
+    "gold": "wm_gold",
+    "audit": "wm_audit",
+    "audit_iceberg": "lake.wm_audit"
+  },
+  "jdbc": {
+    "url": "jdbc:mysql://wm-mysql:3306/wm_crm?serverTimezone=UTC&useSSL=false&allowPublicKeyRetrieval=true",
+    "driver": "com.mysql.cj.jdbc.Driver",
+    "fetchsize": 10000,
+    "overlap_minutes": 60,
+    "tables": {
+      "branch":            {"key": "branch_id",  "partition_column": null,         "num_partitions": 1},
+      "financial_advisor": {"key": "fa_id",      "partition_column": null,         "num_partitions": 1},
+      "party":             {"key": "party_id",   "partition_column": "party_id",   "num_partitions": 4},
+      "account":           {"key": "account_id", "partition_column": "account_id", "num_partitions": 4}
+    }
+  },
+  "kafka": {
+    "bootstrap_servers": "wm-kafka:9092",
+    "topic": "wm.intraday.trades",
+    "max_offsets_per_trigger": 5000
+  },
+  "s3": {
+    "endpoint": "s3.ap-south-1.amazonaws.com"
+  },
+  "tax": {
+    "short_term_rate": 0.35,
+    "long_term_rate": 0.15,
+    "long_term_holding_days": 365
+  },
+  "dq": {
+    "max_quarantine_pct": 5.0,
+    "fail_on_critical": true
+  },
+  "snowflake_tables": {
+    "positions_daily": "POSITIONS_DAILY",
+    "account_valuation_daily": "ACCOUNT_VALUATION_DAILY",
+    "advisor_book_daily": "ADVISOR_BOOK_DAILY",
+    "client_portfolio_summary": "CLIENT_PORTFOLIO_SUMMARY",
+    "realized_gains": "REALIZED_GAINS"
+  }
+}

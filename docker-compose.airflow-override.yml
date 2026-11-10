@@ -1,0 +1,27 @@
+# Applied ON TOP of ~/aether_trade_project's compose files (see `make up`), so the
+# existing Airflow sees this project's DAG, code package, NAS folder and settings
+# without any file in aether_trade_project being edited.
+#
+# Paths are absolute through WM_HOME (exported by the Makefile) because compose
+# resolves relative paths against the aether project directory.
+#
+# Note: Docker creates an empty mount point folder `airflow/dags/wm` inside
+# aether_trade_project the first time this runs. That folder is safe to ignore.
+
+services:
+  airflow-scheduler:
+    env_file:
+      - ${WM_HOME}/.env
+    volumes:
+      - ${WM_HOME}/airflow/dags:/opt/airflow/dags/wm:ro
+      - ${WM_HOME}/dist:/opt/airflow/wm/dist:ro
+      - ${WM_HOME}/conf:/opt/airflow/wm/conf:ro
+      - ${WM_HOME}/nas:/opt/airflow/wm_nas:ro
+      - ${WM_HOME}/data/market:/opt/airflow/wm_market:ro
+      - ${HOME}/.aws:/home/airflow/.aws:ro
+
+  airflow-webserver:
+    env_file:
+      - ${WM_HOME}/.env
+    volumes:
+      - ${WM_HOME}/airflow/dags:/opt/airflow/dags/wm:ro

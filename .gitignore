@@ -1,0 +1,11 @@
+.env
+dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+nas/inbound/
+data/kafka/
+data/market/
+sql/mysql/init/02_seed.sql
+sql/mysql/changes/
+logs/

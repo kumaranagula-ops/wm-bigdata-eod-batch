@@ -1,0 +1,72 @@
+# Extra source systems for the WM batch: MySQL (CRM/OLTP) and Kafka (intraday trades).
+#
+# Hadoop, YARN, Hive, Spark and Airflow come from ~/aether_trade_project. These two
+# containers join that project's "aether-bigdata" network, so the Spark driver and
+# executors running inside YARN containers can reach them by hostname.
+# Container names have no underscores: Hive/Java hostname checks reject them.
+#
+# Start everything with `make up` (it starts the aether stack first).
+
+name: wm
+
+services:
+  wm-mysql:
+    image: mysql:8.4
+    container_name: wm-mysql
+    hostname: wm-mysql
+    restart: unless-stopped
+    command: ["--default-time-zone=+00:00", "--innodb-buffer-pool-size=128M"]
+    environment:
+      MYSQL_ROOT_PASSWORD: ${WM_MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: wm_crm
+      MYSQL_USER: ${WM_MYSQL_USER}
+      MYSQL_PASSWORD: ${WM_MYSQL_PASSWORD}
+    ports:
+      - "3306:3306"
+    volumes:
+      - wm_mysql_data:/var/lib/mysql
+      - ./sql/mysql/init:/docker-entrypoint-initdb.d:ro
+      - ./sql/mysql/changes:/changes:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [bigdata]
+
+  wm-kafka:
+    image: apache/kafka:3.8.0
+    container_name: wm-kafka
+    hostname: wm-kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://wm-kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@wm-kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_HEAP_OPTS: "-Xmx384m -Xms256m"
+    ports:
+      - "29092:29092"
+    volumes:
+      - wm_kafka_data:/var/lib/kafka/data
+      - ./data/kafka:/events:ro
+    networks: [bigdata]
+
+networks:
+  bigdata:
+    external: true
+    name: aether-bigdata
+
+volumes:
+  wm_mysql_data:
+  wm_kafka_data:
