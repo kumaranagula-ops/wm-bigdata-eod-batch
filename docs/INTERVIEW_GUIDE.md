@@ -495,9 +495,9 @@ insert_overwrite(valuation, gold("account_valuation_daily"))
 - The connector runs the `DELETE` in the same session before loading, so a republish
   replaces the date instead of duplicating it.
 
-**Proof**: 2026-11-06 ran twice and 2026-11-09 three times, with identical results
-(21,275 trades = 21,275 distinct IDs, bronze 21,284 rows not doubled, 11,515 positions,
-the same 5 recon breaks, Snowflake counts equal to Hive).
+**Proof**: 2026-11-06 ran twice with identical results (21,275 trades = 21,275 distinct
+IDs, bronze 21,284 rows not doubled, 11,515 positions, the same 5 recon breaks).
+2026-11-09 has since run three times, all green.
 
 ### Rerun 1: the same business date ran twice (idempotency proven by accident)
 
