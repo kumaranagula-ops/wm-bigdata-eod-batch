@@ -189,45 +189,207 @@ after parsing.
 
 ---
 
-## 7. Tuning story (use it for "tell me about a performance problem")
+## 7. Tuning stories (use them for "tell me about a performance problem")
 
-1. **Symptom**: the gold job's lots stage had one task far slower than the median.
-2. **Diagnosis**: in the Stages tab, the max task duration was far above the median, and
-   `groupBy(account_id).count()` showed the Private Wealth team's 25 trust accounts carried
-   a large share of the trades. That's key skew.
-3. **Fixes, in order**: broadcast the small dimensions (securities, FAs, prices, splits) so the
-   big side is never shuffled for them; keep **AQE skew join** on so oversized join partitions
-   are split; filter and select columns before the shuffle; persist buys/sells because three
-   outputs reuse them. If AQE can't help (skew in an aggregation), **salt** the hot keys:
-   aggregate on (key, salt), then on key.
-4. **Verify**: read `explain("formatted")` (BroadcastHashJoin instead of SortMergeJoin,
-   PushedFilters on the partition column), compare stage times before and after, one change
-   at a time.
+Each story follows **situation → what I saw → what I changed → how I verified**. Tell one,
+keep the other two for follow-ups.
 
-Scale-up talking points: target ~128 MB partitions, size executors at 4–5 cores, raise
-`memoryOverhead` for PySpark, compact small files, partition facts by month, bucket or
-Z-order by account for repeated joins.
+### Tuning story 1: skewed accounts in the FIFO tax-lot job
+
+- **Situation**: `gold_book_of_record` builds FIFO tax lots for every account and
+  security. The Private Wealth team's 25 trust accounts trade about 15x more than
+  everyone else ([generate_data.py](../scripts/generate_data.py) plants this on purpose).
+- **What to look for**: the joins on `account_id` put those 25 accounts into a few
+  shuffle partitions. In the Spark UI Stages tab, one or two tasks run far longer than
+  the median (the classic straggler pattern), and the whole stage waits for them.
+  `groupBy("account_id").count()` ordered by count confirms the hot keys.
+- **What I changed** ([gold_book_of_record.py](../wm_pipeline/jobs/gold_book_of_record.py)):
+  1. **Broadcast every small dimension**: securities, FAs, branches, prices and splits
+     (`F.broadcast(...)`). The big trades side is never shuffled to join them.
+  2. **AQE skew join on** (`spark.sql.adaptive.skewJoin.enabled` in
+     [context.py](../wm_pipeline/context.py)): Spark splits an oversized join partition
+     into smaller tasks at runtime.
+  3. **Select only needed columns and filter (`trade_date <= as_of`, not CANCEL) before
+     the shuffle**, so less data moves.
+  4. **No Python UDFs**: FIFO matching is done with window functions and a range join
+     ([lots.py](../wm_pipeline/transforms/lots.py)), so everything stays in the JVM.
+- **How I verified**: `positions.explain("formatted")` is printed to the driver log
+  (`make yarn-logs JOB=gold_book_of_record`). It shows `BroadcastHashJoin` for the
+  dimensions instead of `SortMergeJoin`. I compared stage times before and after, one
+  change at a time.
+- **Fallback if AQE isn't enough** (e.g. skew inside an aggregation, not a join): salt
+  the hot keys: add `salt = rand() * N`, aggregate on `(account_id, salt)`, then
+  aggregate again on `account_id`.
+
+### Tuning story 2: making the batch fit a 4 GB YARN cluster
+
+- **Situation**: the cluster has one NodeManager with 4 GB for YARN. The DAG has four
+  bronze jobs that could run in parallel, and each is a separate Spark application.
+- **The problem**: if several `spark-submit`s start at once, each gets an
+  ApplicationMaster container and then **waits for executors** that don't fit.
+  Applications sit in ACCEPTED or RUNNING with no executors in the YARN UI, and tasks
+  run until they time out. That's a resource deadlock: every app holds part of the
+  memory, and none can finish.
+- **What I changed**:
+  1. **Airflow pool `wm_yarn` with 1 slot**: every Spark task uses the pool, so only one
+     application runs at a time. The DAG graph still shows which steps are independent.
+  2. **Right-sized each application** in `spark_submit()`
+     ([wm_eod_batch_dag.py](../airflow/dags/wm_eod_batch_dag.py)): driver 768m and
+     executors 768m with overhead counted, and only the heavy `gold_book_of_record` job
+     gets `executor_memory="1g"`.
+  3. **Persist only what is reused**: buys and sells are `persist(MEMORY_AND_DISK)`
+     because three outputs read them (lots, realized gains, positions), then
+     `unpersist()` at the end. `MEMORY_AND_DISK` spills instead of failing when memory
+     is tight.
+- **How I verified**: all three business dates ran green end to end on YARN, with no
+  applications stuck in ACCEPTED.
+- **On a real cluster**: raise the pool size or point teams at separate YARN queues
+  (capacity scheduler), and size executors at 4–5 cores with about 10% `memoryOverhead`.
+
+### Tuning story 3: CRM extract from MySQL, from one slow read to parallel incremental reads
+
+- **Situation**: `bronze_crm_jdbc` pulls party, account, FA and branch tables from MySQL
+  every night.
+- **What I saw**: a plain `spark.read.jdbc(url, "account")` reads through **one
+  connection in one task**, whatever the cluster size, and pulls the whole table every
+  night. With the driver's default `fetchsize`, it also makes many small round trips.
+- **What I changed** ([bronze_crm_jdbc.py](../wm_pipeline/jobs/bronze_crm_jdbc.py)):
+  1. **Incremental extract**: a subquery as `dbtable` with
+     `WHERE updated_at > <last high watermark − 60 min>`, so only changed rows are read
+     (the Sqoop `--incremental lastmodified` pattern).
+  2. **Parallel read**: a bounds query (`SELECT min(id), max(id) ... WHERE <same filter>`)
+     feeds `partitionColumn`, `lowerBound`, `upperBound` and `numPartitions=4`, so Spark
+     opens 4 connections, each reading one id range.
+  3. **Bigger `fetchsize`** from config to cut round trips.
+- **How I verified**: the job logs the window, row count and number of partitions for
+  each table (`ctx.metrics`). After the initial load, a day's run pulls only rows
+  changed since the previous date's watermark (on day 2: the FA move, the new client
+  and the risk-profile updates), not the full tables.
+- **Caution I can mention**: keep `numPartitions` small enough not to overload the
+  source database; a production OLTP DB has a connection limit.
 
 ---
 
-## 8. Failure and rerun scenarios
+## 8. Failure and rerun scenarios we actually ran
 
-- **Rerun the same date**: bronze and gold overwrite their partition; silver MERGEs are
-  keyed (a trade is only replaced by a newer version); JDBC re-reads the same window;
-  Kafka resumes from the checkpoint. Running 2026-11-06 twice gives identical results.
-- **Backfill**: trigger with `{"business_date": "..."}` for each date in order.
-- **Late correction**: a v2 of an old trade arrives in a later file. The MERGE updates the
-  trade, and the next gold run reflects it, because gold recomputes from silver.
-- **Bad file**: the reject-rate gate fails the silver task. Look at `silver.quarantine`, fix
-  upstream, rerun the date.
-- **Source missing**: the sensor times out after 2 hours (reschedule mode frees the worker
-  slot while waiting).
-- **Where to look first**: `make status` (run_control + failed DQ), then the Airflow task log
-  (full spark-submit output), then the YARN application logs and Spark History Server.
+### Rerun 1: the same business date ran twice (idempotency proven by accident)
+
+- **What happened**: when I unpaused the DAG, Airflow created the **scheduled** run for
+  2026-11-06 automatically, on top of the manual run I had already done. The whole
+  batch ran twice for the same date.
+- **Result**: identical numbers: 21,275 trades = 21,275 distinct trade IDs, bronze
+  stayed at 21,284 rows (not doubled), 11,515 positions, the same 5 recon breaks.
+  Later 2026-11-09 also ran three times with the same results.
+- **Why it was safe**: bronze and gold use dynamic partition overwrite for that date,
+  silver uses a keyed, version-guarded MERGE, the JDBC watermark reads the previous
+  date's window, and Kafka resumes from its checkpoint.
+- **Lesson**: `catchup=False` still creates the latest scheduled run when you unpause.
+  Expect it, and design every job so a rerun is harmless.
+
+### Rerun 2: a task killed mid-run, recovered by retry
+
+- **What happened**: I restarted the Airflow scheduler (to pick up a fixed package) while
+  `bronze_trades_stream` was running. The task process was killed.
+- **Recovery**: the task has `retries=1` with a 2-minute delay. The retry started on its
+  own and succeeded. No one cleared anything.
+- **Why no duplicates or lost events**: Kafka offsets are committed in the HDFS
+  checkpoint only after a micro-batch is written, so the retry restarted from the last
+  committed offset. Anything replayed twice is removed by silver's `dropDuplicates` and
+  `row_number` on `trade_id`.
+
+### Rerun 3: fix a code bug, then resume from the failed task (not from the start)
+
+- **What happened**: `silver_transactions` failed on YARN with an `AnalysisException`
+  ("Invalid call to dataType on unresolved object") from `F.nullif(...)`. Bronze had
+  already succeeded.
+- **Recovery steps**:
+  1. Airflow log → YARN application ID → `make yarn-logs JOB=silver_transactions`
+     for the Python stack trace (in cluster mode the driver log is in YARN, not Airflow).
+  2. Fixed the code: `F.when(F.col("security_id") != "", F.col("security_id"))`.
+  3. `make build` to redeploy the zip that `spark-submit --py-files` ships.
+  4. Cleared `silver_transactions` **with Downstream** ticked. Bronze was not rerun.
+- **Result**: silver, gold, recon and publish ran green; `run_control` showed SUCCESS.
+
+Other recovery patterns (not hit, but ready):
+- **Backfill**: trigger with `{"business_date": "..."}` for each date **in order**,
+  because each date's JDBC window starts from the previous date's watermark.
+- **Late correction**: a v2 of an old trade arrives later; the MERGE updates it and
+  the next gold run reflects it, because gold recomputes from silver.
+- **Source missing**: the sensor times out after 2 hours; deliver the file, clear the
+  sensor with Downstream.
+- **Where to look first**: `make status` (run_control + failed DQ), the Airflow task
+  log, then the YARN application log and Spark History Server.
 
 ---
 
-## 9. Likely questions, short answers
+## 9. Major pipeline and data issues we hit (and how we fixed them)
+
+### Issue 1: one invalid date failed the whole cash load
+
+- **What we saw**: the cash activity file (PSV, `MM/dd/yyyy` dates) had one row with
+  `13/45/2026`. Instead of that one value becoming NULL, the bronze job failed with
+  `SparkUpgradeException` ("Fail to parse ... in the new parser"). One bad row in about
+  71k stopped the batch.
+- **Root cause**: Spark 3's date parser is stricter than Spark 2's. When a value parses
+  differently between the old and new parser, Spark raises an error by default
+  instead of guessing.
+- **Fix**: `spark.sql.legacy.timeParserPolicy=CORRECTED` (use the new parser, invalid
+  dates become NULL), plus an explicit rule in silver: a NULL `txn_date` goes to
+  `silver.quarantine` with reason `MISSING_TXN_DATE`
+  ([silver_transactions.py](../wm_pipeline/jobs/silver_transactions.py)).
+- **Lesson**: one bad record should be quarantined with a reason, not crash the batch
+  and not be silently dropped. The batch fails only when the reject rate is abnormal.
+
+### Issue 2: duplicate and conflicting trades from Kafka and the custodian file
+
+- **What we saw**: the same trades arrived from two sources: the OMS Kafka stream during
+  the day and the custodian's end-of-day file. Kafka also **redelivered** events
+  (at-least-once): 306 events, only 304 distinct. Some trades also had a corrected
+  version (v2) or a same-day cancel.
+- **Risk**: a plain append would double-count holdings and cash for those trades, and
+  positions would break against the custodian.
+- **Fix** ([trades.py](../wm_pipeline/transforms/trades.py),
+  [silver_transactions.py](../wm_pipeline/jobs/silver_transactions.py)):
+  1. `dropDuplicates` on all trade columns plus source removes exact redeliveries.
+  2. `row_number()` per `trade_id`, ordered by `version DESC`, then source priority
+     (FILE beats STREAM, because the custodian file is the book of record), then
+     `exec_ts`: exactly one row per trade.
+  3. A MERGE that updates only when the incoming version is newer (or the same version
+     from the file replacing the stream). CANCEL is a soft delete: kept in silver,
+     excluded from positions.
+- **Verified**: trade count = distinct trade IDs on every date, and the silver row count
+  reconciles: in = merged + rejected + duplicates + superseded versions.
+
+### Issue 3: the deployed code disappeared from Airflow after a rebuild (setup issue)
+
+- **What we saw**: after `make build`, Spark tasks started failing because the
+  `wm_pipeline` package and job files they ship with `--py-files` were not there. On
+  the Mac the files existed, but inside the Airflow container `dist/` was **empty**.
+- **Root cause**: the build ran `rm -rf dist` and recreated it. The container's bind
+  mount still pointed at the **old, deleted** directory, so the container saw an
+  empty folder.
+- **Fix**: the build now writes the zip to a temporary file and `mv`s it into the
+  existing `dist/` folder (the directory is never deleted). I restarted the scheduler
+  once to pick up the fixed mount.
+- **Lesson**: deployment is part of the pipeline. In production this is solved by
+  building a versioned artifact (wheel or zip) in CI and deploying it to a fixed
+  location, never editing files in place on the scheduler.
+
+Other data problems the pipeline handles (good for follow-up questions):
+- **2-for-1 stock split on SEC00001 (2026-11-10)**: lots are adjusted with a cumulative
+  split factor (`exp(sum(log(ratio)))`), so quantity doubles, price halves, cost basis
+  stays the same, and recon still matches the custodian.
+- **FA departure**: FA 9040 left and 59 accounts moved to FA 9012. SCD2 on accounts keeps
+  history correct: 11-06 AUM stays with FA 9040, from 11-09 it moves to FA 9012.
+- **Orphan and malformed records**: trades with unknown accounts or securities
+  (`left_anti` join), malformed CSV and JSON lines (`_corrupt_record`), all go to
+  quarantine with a reason.
+- **Custodian breaks**: 3 quantity breaks, 1 missing, 1 extra per day are reported by
+  the full outer join in `middle_office_recon` as WARN, for operations to investigate.
+
+---
+
+## 10. Likely questions, short answers
 
 - **Client vs cluster mode?** Cluster in production: the driver runs on YARN and survives
   the Airflow worker restarting. Client for interactive debugging.
