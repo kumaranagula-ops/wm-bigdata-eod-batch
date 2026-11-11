@@ -111,14 +111,241 @@ Spark hash-partitions on (account, security) instead of doing a cartesian produc
 UDFs and no Python loops; it scales like any other join. Proven in
 [tests/test_transforms.py](../tests/test_transforms.py).
 
-### SCD2 with one MERGE (the "staged union")
+### CDC and SCD in this project (deep-dive)
 
-A MERGE can't close and insert for the same key in one pass. So changed rows are staged
-twice: once with `merge_key = account_id` (matches the current row, closes it with
-`effective_to = new_from − 1`) and once with `merge_key = NULL` (never matches, inserts the
-new version). New accounts appear once and insert. Facts join with
-`effective_from <= as_of <= effective_to`, so a position on 11-06 still belongs to the FA
-who had the account that day, even after the 11-09 reassignment.
+**CDC (change data capture)** is how we find *what changed in the source*. **SCD (slowly
+changing dimension)** is how we *store* those changes in the warehouse. The pipeline uses
+two CDC styles and two SCD types:
+
+| | What | Where |
+|---|---|---|
+| CDC type 1 | **Query-based (timestamp/watermark) CDC** from MySQL | [bronze_crm_jdbc.py](../wm_pipeline/jobs/bronze_crm_jdbc.py) |
+| CDC type 2 | **Version-based event CDC** on trades (Kafka + custodian file: NEW / CORRECT / CANCEL with a version number) | [silver_transactions.py](../wm_pipeline/jobs/silver_transactions.py), [trades.py](../wm_pipeline/transforms/trades.py) |
+| Helper | **Hash-based change detection**: compare incoming rows with the current row | [scd.py](../wm_pipeline/transforms/scd.py) `row_hash` |
+| SCD Type 1 | Overwrite, no history: branch, financial advisor, party, security | [silver_reference.py](../wm_pipeline/jobs/silver_reference.py) `merge_scd1` |
+| SCD Type 2 | Full history with effective dates: account | [silver_reference.py](../wm_pipeline/jobs/silver_reference.py) + `stage_scd2` |
+
+#### CDC type 1: query-based (timestamp) CDC from the MySQL CRM
+
+**How it works**: every CRM table has `updated_at`. Each night we read only rows changed
+since the last successful extract. It's the Sqoop `--incremental lastmodified` pattern,
+done with Spark JDBC.
+
+```python
+# bronze_crm_jdbc.py
+prev = spark.sql(f"""SELECT max(high_watermark) AS hw FROM {wm_table}
+    WHERE source_table = '{table}' AND business_date < '{bd}'""").first()["hw"]
+low = (prev - dt.timedelta(minutes=jcfg["overlap_minutes"])) if prev else EPOCH   # 60-min overlap
+where = f"updated_at > '{low:%Y-%m-%d %H:%M:%S}'"
+df = spark.read.jdbc(url, f"(SELECT * FROM {table} WHERE {where}) src", properties=props, **reader_opts)
+# ... write bronze partition extract_date = bd, then save the new high watermark (MERGE)
+```
+
+Because of the overlap, the same key can arrive twice, so silver keeps the newest per key:
+
+```python
+# scd.py
+def latest_per_key(df, key, order_col="updated_at"):
+    w = Window.partitionBy(key).orderBy(F.col(order_col).desc(), F.col("_load_ts").desc())
+    return df.withColumn("_rn", F.row_number().over(w)).filter("_rn = 1").drop("_rn")
+```
+
+**What it captured in our run** (day-2 changes, `make crm-changes`, all with
+`updated_at = 2026-11-09 17:30`): FA 9040 set to TERMINATED, 59 accounts moved from FA
+9040 to FA 9012, 10 parties changed risk profile, 1 new party with 1 new account. The
+11-09 extract picked up only those rows, not the full tables.
+
+**Limits (say these, they show maturity)**:
+- **Hard deletes are invisible**: a deleted row has no `updated_at` to find. Our CRM
+  uses soft deletes (`status = CLOSED`, `close_date`), which flow through as updates.
+- **Intermediate changes are lost**: if a row changes twice between extracts, we see
+  only the last state.
+- It relies on the source always setting `updated_at` correctly, and it adds query load
+  on the source.
+- **Production alternative**: **log-based CDC** (Debezium reading the MySQL binlog into
+  Kafka). It captures every insert, update and delete in order, with no source query
+  load. Same downstream MERGE, different extract.
+
+#### CDC type 2: version-based event CDC on trades
+
+**How it works**: trades arrive as **change events**, not snapshots. Each row has
+`trade_id`, `version` and `trade_status`:
+- `NEW`, version 1: the original booking (intraday from Kafka, and again in the EOD file)
+- `CORRECT`, version 2: an amended trade (e.g. corrected price)
+- `CANCEL`, version 2: the trade was busted, so it must not count
+
+We apply the events in three steps (code in §8, mechanism 4):
+1. `dropDuplicates`: removes Kafka redeliveries (at-least-once: 306 events, 304 distinct).
+2. `row_number()` per `trade_id` ordered by `version DESC`, then FILE before STREAM, then
+   `exec_ts`: one winning row per trade.
+3. `MERGE ... ON trade_id`: insert new trades, update only if the incoming version is newer
+   (or the same version from the book-of-record file replacing the stream copy).
+
+**CANCEL is a soft delete**: the trade stays in silver with `trade_status = 'CANCEL'` (full
+audit trail), and gold excludes it:
+
+```python
+# gold_book_of_record.py
+.filter((F.col("trade_date") <= as_of) & (F.col("trade_status") != "CANCEL"))
+```
+
+**Example**: trade T is booked at $100.00 (v1, Kafka), and the EOD file brings v2
+`CORRECT` at $98.50. Silver ends with one row, v2. Gold recomputes the lot cost and
+positions from v2. If a v2 `CANCEL` arrived instead, the row stays in silver flagged
+CANCEL, and positions behave as if the trade never happened.
+
+#### Hash-based change detection (used by both SCD types)
+
+```python
+# scd.py
+def row_hash(*cols):
+    return F.sha2(F.concat_ws("|", *[F.coalesce(F.col(c).cast("string"), F.lit("<null>")) for c in cols]), 256)
+```
+
+- One `sha2` over the tracked columns, instead of comparing 10 columns one by one with
+  null-safe logic.
+- The `<null>` marker and the `|` separator make sure `NULL` vs `''`, or `('ab','c')` vs
+  `('a','bc')`, never produce the same hash.
+- If the hash is unchanged, nothing is written. That's why a rerun, or a CRM row touched
+  with no real change, creates no update and no new version.
+
+#### SCD Type 1: overwrite (branch, financial advisor, party, security)
+
+**When**: the business only needs the **current** value. A corrected branch name or a
+party's new risk profile replaces the old value; history isn't reported on.
+
+```python
+# silver_reference.py
+def merge_scd1(ctx, source_df, target, key, hash_cols):
+    src = source_df.withColumn("_row_hash", row_hash(*hash_cols)).withColumn("_batch_id", F.lit(ctx.batch_id))
+    src = src.select(*ctx.spark.table(target).columns)
+    src.createOrReplaceTempView("src")
+    ctx.spark.sql(f"""
+        MERGE INTO {target} t USING src s ON t.{key} = s.{key}
+        WHEN MATCHED AND t._row_hash <> s._row_hash THEN UPDATE SET *
+        WHEN NOT MATCHED THEN INSERT *""")
+```
+
+**In our run**: the 10 party risk-profile changes were updated in place in `dim_party`,
+FA 9040's status became TERMINATED in `dim_financial_advisor`, and the new party was
+inserted. One row per key, always.
+
+**Governance done in the same step**: `email_masked` (`a***@mail.example`) is stored
+instead of the full e-mail address, and only the last 4 digits of the tax ID are kept.
+
+#### SCD Type 2: full history (account)
+
+**Why account is Type 2**: the FA, account type, tax status and status are
+**audit-relevant**. A position on a past date must roll up to the advisor who serviced
+the account **on that date**. Compensation, AUM reports and regulators all depend on it.
+
+**Table columns**: business key `account_id`, surrogate key `account_sk`, tracked
+attributes, `_row_hash`, `effective_from`, `effective_to` (open = `9999-12-31`),
+`is_current`.
+
+**Tracked columns** (a change in any of them creates a new version):
+
+```python
+SCD2_TRACKED = ["account_number", "party_id", "account_type", "tax_status", "fa_id", "open_date",
+                "close_date", "status", "base_currency", "cost_basis_method"]
+```
+
+**Step 1, prepare the incoming rows**:
+
+```python
+acct = (acct.withColumn("_row_hash", row_hash(*SCD2_TRACKED))
+        .join(known.withColumn("_known", F.lit(True)), "account_id", "left")
+        # New account: history starts at open_date. Change: takes effect the day it was made.
+        .withColumn("effective_from",
+                    F.when(F.col("_known"), F.to_date("updated_at")).otherwise(F.col("open_date")))
+        .withColumns({"effective_to": F.lit("9999-12-31").cast("date"),
+                      "is_current": F.lit(True),
+                      "account_sk": F.xxhash64("account_id", "effective_from"),   # same key on rerun
+                      "_batch_id": F.lit(ctx.batch_id)}))
+```
+
+**Step 2, staged union**: a single MERGE can't both close the old row and insert the new
+row for the **same key**. So changed rows are sent twice:
+
+```python
+def stage_scd2(source, current, key):
+    changed = (source.alias("s")
+               .join(current.select(key, F.col("_row_hash").alias("_cur_hash")), key, "inner")
+               .filter(F.col("_row_hash") != F.col("_cur_hash")).drop("_cur_hash"))
+    return (source.withColumn("merge_key", F.col(key))                              # copy A
+            .unionByName(changed.withColumn("merge_key", F.lit(None).cast(...))))   # copy B
+```
+
+**Step 3, one MERGE**:
+
+```sql
+MERGE INTO lake.wm_silver.dim_account t
+USING staged s
+ON t.account_id = s.merge_key AND t.is_current = true
+WHEN MATCHED AND t._row_hash <> s._row_hash THEN
+    UPDATE SET t.is_current = false, t.effective_to = date_sub(s.effective_from, 1)   -- close old
+WHEN NOT MATCHED THEN INSERT (...) VALUES (...)                                       -- open new
+```
+
+| Incoming row | Copy A (`merge_key = account_id`) | Copy B (`merge_key = NULL`) |
+|---|---|---|
+| **Changed** account | Matches the current row → **closes** it | Never matches → **inserts** the new version |
+| **New** account | No current row → **inserts** it | not staged |
+| **Unchanged** account | Matches, but hash equal → **nothing** | not staged |
+
+**Our real example, account 5000057** (moved from FA 9040 to FA 9012 on 2026-11-09):
+
+| account_id | fa_id | effective_from | effective_to | is_current |
+|---|---|---|---|---|
+| 5000057 | 9040 | open_date | **2026-11-08** | false |
+| 5000057 | 9012 | **2026-11-09** | 9999-12-31 | true |
+
+Result after the day-2 run: **2,380 account versions, 2,321 current**: 59 moved accounts
+got a second version, and 1 new account was inserted.
+
+**Step 4, how facts use it (as-of join)**:
+
+```python
+# gold_book_of_record.py
+acct = (silver("dim_account")
+        .filter((F.col("effective_from") <= as_of) & (F.col("effective_to") >= as_of)))
+```
+
+So the 2026-11-06 AUM report still shows those 59 accounts under FA 9040, and from
+2026-11-09 they roll up to FA 9012. Rerunning 11-06 today gives the same 11-06 answer.
+
+**Data-quality checks that guard the SCD2 table** (`silver_reference.py`):
+- `dim_account_one_current_row_per_key`: never two `is_current` rows for one account
+- `dim_account_no_overlapping_versions`: `effective_to` is never before `effective_from`
+- `dim_account_fa_exists`: every current account points to a known FA
+- `accounts_with_terminated_fa` (WARN): an active account still assigned to a terminated
+  FA means the book wasn't reassigned before the FA left
+
+#### Other SCD types (if they ask)
+
+| Type | Idea | Where it would fit here |
+|---|---|---|
+| 0 | Never change | `open_date`, `date_of_birth` |
+| 1 | Overwrite (**we use it**) | branch, FA, party, security |
+| 2 | New row per change (**we use it**) | account |
+| 3 | Keep the previous value in an extra column (`prev_fa_id`) | Only "current and previous FA" reports |
+| 4 | Current table plus a separate history table | Very large, frequently changing dimensions |
+| 6 | 1 + 2 + 3: SCD2 rows plus a current-value column on every row | "Report history, but also show today's FA" |
+
+#### 30-second interview answer
+
+> "We use two CDC styles. From the MySQL CRM it's query-based CDC: a watermark on
+> `updated_at` per table and per business date, with a 60-minute overlap. That's
+> deduplicated with `row_number` on the key. It can't see hard deletes, so the CRM uses
+> soft deletes; in production I'd move to log-based CDC with Debezium. Trades are
+> event CDC: each event has a version and a status, NEW, CORRECT or CANCEL. We
+> dedupe, keep the highest version per `trade_id`, and MERGE only when the version is
+> newer. CANCEL is a soft delete that gold excludes. For storage, branch, FA, party
+> and security are SCD Type 1, a hash-guarded MERGE that overwrites. Account is SCD
+> Type 2, because the FA on a past date matters for AUM and compensation. We do it in
+> one MERGE using the staged-union pattern, with a deterministic `xxhash64` surrogate
+> key, and gold joins it as-of the business date. When FA 9040 left, 59 accounts got a
+> second version, and 11-06 reports still show them under 9040."
 
 ---
 
