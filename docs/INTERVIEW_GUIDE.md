@@ -272,6 +272,233 @@ keep the other two for follow-ups.
 
 ## 8. Failure and rerun scenarios we actually ran
 
+### How every layer is rerun-safe (the mechanisms behind all the scenarios)
+
+The rule: **every write is either a partition overwrite keyed by the business date, or a
+keyed MERGE that changes a row only when the incoming data is newer or different. Gold
+is recomputed, never incremented.** So any date can be rerun, from any failed task, and
+gives the same result.
+
+| # | Layer | Mechanism | Why a rerun is safe |
+|---|---|---|---|
+| 1 | Bronze (files, market, CRM) | Dynamic partition overwrite | Replaces only that date's partition; other dates untouched |
+| 2 | Bronze CRM (JDBC) | Watermark per table **and** per business date | A rerun re-reads the same window; the watermark moves only after the write |
+| 3 | Bronze Kafka | Structured Streaming checkpoint | Resumes from the last committed offset |
+| 4 | Silver trades | `dropDuplicates` → `row_number` → version-guarded MERGE | Same version again = no change; only a newer version updates |
+| 5 | Silver dimensions | Hash-guarded SCD1 MERGE, staged-union SCD2 MERGE, deterministic surrogate key | Same hash = no new version, same key every run |
+| 6 | Gold | Recompute from silver + partition overwrite | Not "yesterday + today", so nothing is added twice |
+| 7 | Snowflake | `DELETE` preaction for the date, then append | The date is replaced, never duplicated |
+
+#### 1. Bronze: dynamic partition overwrite
+
+[context.py](../wm_pipeline/context.py), set once in `build_spark()` and used by every bronze
+and gold write:
+
+```python
+"spark.sql.sources.partitionOverwriteMode": "dynamic",
+"hive.exec.dynamic.partition": "true",
+"hive.exec.dynamic.partition.mode": "nonstrict",
+
+def insert_overwrite(df: DataFrame, table: str) -> None:
+    """insertInto matches by POSITION, so always reorder to the table's columns first.
+    With partitionOverwriteMode=dynamic only the partitions present in df are replaced."""
+    spark = df.sparkSession
+    df.select(*spark.table(table).columns).write.insertInto(table, overwrite=True)
+```
+
+```python
+out = df.withColumn("business_date", F.lit(bd))      # bronze_nas_files.py
+insert_overwrite(out, ctx.table("bronze", table))
+```
+
+- `overwrite=True` with **dynamic** mode replaces only the partitions present in the
+  DataFrame (`business_date=2026-11-09`). The default **static** mode would wipe the
+  whole table.
+- `select(*table.columns)` protects against `insertInto` matching columns by position.
+
+#### 2. Bronze JDBC: watermark per table and per business date
+
+[bronze_crm_jdbc.py](../wm_pipeline/jobs/bronze_crm_jdbc.py):
+
+```python
+# Low watermark = the previous DATE's high watermark (strictly < bd), not my own
+prev = spark.sql(f"""
+    SELECT max(high_watermark) AS hw FROM {wm_table}
+    WHERE source_table = '{table}' AND business_date < '{bd}'""").first()["hw"]
+low = (prev - dt.timedelta(minutes=jcfg["overlap_minutes"])) if prev else EPOCH
+where = f"updated_at > '{low:%Y-%m-%d %H:%M:%S}'"
+
+df = spark.read.jdbc(jcfg["url"], f"(SELECT * FROM {table} WHERE {where}) src",
+                     properties=props, **reader_opts)
+out = ctx.add_audit_columns(df, with_file=False).withColumn("extract_date", F.lit(bd))
+insert_overwrite(out, ctx.table("bronze", f"crm_{table}_raw"))
+high = out.agg(F.max("updated_at")).first()[0] or prev or low
+
+# Record the window only AFTER the data landed
+spark.sql(f"""
+    MERGE INTO {wm_table} t
+    USING (SELECT '{table}' AS source_table, '{bd}' AS business_date, ...) s
+    ON t.source_table = s.source_table AND t.business_date = s.business_date
+    WHEN MATCHED THEN UPDATE SET *
+    WHEN NOT MATCHED THEN INSERT *""")
+```
+
+- `business_date < '{bd}'`: a rerun of 11-09 reads the watermark saved by 11-06, not its
+  own earlier attempt, so it pulls exactly the same window.
+- The watermark table is MERGEd on `(source_table, business_date)`, so it never gets
+  duplicate rows.
+- The watermark is saved **after** the write, so a job that dies mid-write loses nothing.
+- The 60-minute overlap catches late commits; the duplicates it creates are removed in
+  silver.
+
+#### 3. Bronze Kafka: checkpoint
+
+[bronze_trades_stream.py](../wm_pipeline/jobs/bronze_trades_stream.py):
+
+```python
+checkpoint = f"{ctx.cfg['hdfs']['checkpoints']}/trades_stream_raw"
+query = (events.writeStream
+         .foreachBatch(write_batch)
+         .option("checkpointLocation", checkpoint)
+         .trigger(availableNow=True)
+         .start())
+```
+
+- Consumed offsets are stored in the HDFS checkpoint, so a rerun or retry starts after the
+  last committed offset.
+- Kafka is at-least-once anyway, so silver (mechanism 4) removes anything replayed twice.
+
+#### 4. Silver trades: unique source, then version-aware MERGE
+
+Step A, remove exact copies ([silver_transactions.py](../wm_pipeline/jobs/silver_transactions.py)):
+
+```python
+deduped = incoming.dropDuplicates(TRADE_COLUMNS + ["record_source"])
+```
+
+Step B, one row per `trade_id`, chosen deterministically ([trades.py](../wm_pipeline/transforms/trades.py)):
+
+```python
+def latest_trade_versions(trades: DataFrame) -> DataFrame:
+    priority = F.create_map(...)            # FILE -> 1, STREAM -> 2
+    w = Window.partitionBy("trade_id").orderBy(
+        F.col("version").desc(),                         # highest version first
+        priority[F.col("record_source")].asc(),          # custodian file beats stream
+        F.col("exec_ts").desc())                         # final tie breaker
+    return (trades.withColumn("_rn", F.row_number().over(w))
+            .filter("_rn = 1").drop("_rn"))
+```
+
+Step C, upsert into Iceberg:
+
+```sql
+MERGE INTO lake.wm_silver.fact_trade t
+USING trades_src s
+ON t.trade_id = s.trade_id
+WHEN MATCHED AND (s.version > t.version
+                  OR (s.version = t.version AND s.record_source = 'FILE' AND t.record_source = 'STREAM'))
+    THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *
+```
+
+Quarantine replaces only that date's partition:
+
+```python
+all_q.select(...).writeTo("lake.wm_silver.quarantine").overwritePartitions()
+```
+
+- A MERGE fails if two source rows match one target row. Step B guarantees one row per
+  `trade_id`.
+- On a rerun the same trade arrives with the **same version**, so the matched condition is
+  false and nothing changes. Only a real correction or cancel (a newer version) updates.
+- The ordering is fully deterministic. A `row_number()` with ties could pick a different
+  winner on a retry.
+
+#### 5. Silver dimensions: hash-guarded SCD1, staged-union SCD2
+
+SCD1 (branch, advisor, party, security) in [silver_reference.py](../wm_pipeline/jobs/silver_reference.py):
+
+```python
+def merge_scd1(ctx, source_df, target, key, hash_cols):
+    src = source_df.withColumn("_row_hash", row_hash(*hash_cols))
+    ...
+    MERGE INTO {target} t USING src s ON t.{key} = s.{key}
+    WHEN MATCHED AND t._row_hash <> s._row_hash THEN UPDATE SET *     -- only real changes
+    WHEN NOT MATCHED THEN INSERT *
+```
+
+Row hash in [scd.py](../wm_pipeline/transforms/scd.py):
+
+```python
+def row_hash(*cols):
+    # fixed column order + explicit null marker: NULL and '' never hash the same
+    return F.sha2(F.concat_ws("|", *[F.coalesce(F.col(c).cast("string"), F.lit("<null>")) for c in cols]), 256)
+```
+
+SCD2 on accounts: stage first, then one MERGE:
+
+```python
+def stage_scd2(source, current, key):
+    changed = (source.alias("s")
+               .join(current.select(key, F.col("_row_hash").alias("_cur_hash")), key, "inner")
+               .filter(F.col("_row_hash") != F.col("_cur_hash")))
+    return (source.withColumn("merge_key", F.col(key))                       # closes old / inserts brand-new
+            .unionByName(changed.withColumn("merge_key", F.lit(None)...)))   # inserts the new version
+```
+
+```sql
+MERGE INTO lake.wm_silver.dim_account t
+USING staged s
+ON t.account_id = s.merge_key AND t.is_current = true
+WHEN MATCHED AND t._row_hash <> s._row_hash THEN
+    UPDATE SET t.is_current = false, t.effective_to = date_sub(s.effective_from, 1)
+WHEN NOT MATCHED THEN INSERT (...) VALUES (...)
+```
+
+```python
+"account_sk": F.xxhash64("account_id", "effective_from")    # deterministic surrogate key
+```
+
+- On a rerun the incoming hash equals the current hash, so `changed` is empty, no new
+  version is staged, and nothing is closed or inserted.
+- `xxhash64(account_id, effective_from)` gives the same surrogate key every run. A
+  sequence or `monotonically_increasing_id()` would hand out new keys on each rerun.
+
+#### 6. Gold: recompute from silver, never increment
+
+[gold_book_of_record.py](../wm_pipeline/jobs/gold_book_of_record.py):
+
+```python
+trades = (silver("fact_trade")
+          .filter((F.col("trade_date") <= as_of) & (F.col("trade_status") != "CANCEL")) ...)
+# ... FIFO lots -> positions -> realized gains -> cash -> valuation ...
+insert_overwrite(lots,      gold("tax_lots_open"))
+insert_overwrite(positions, gold("positions_daily"))
+insert_overwrite(realized,  gold("realized_gains"))
+insert_overwrite(cash,      gold("cash_balances_daily"))
+insert_overwrite(valuation, gold("account_valuation_daily"))
+```
+
+- Positions are **not** "yesterday's positions + today's trades" (a rerun would add today's
+  trades twice). They are rebuilt from all deduplicated silver trades up to the as-of
+  date, and that date's partition is overwritten. Same input, same output.
+
+#### 7. Snowflake: delete the date, then append
+
+[publish_snowflake.py](../wm_pipeline/jobs/publish_snowflake.py):
+
+```python
+.option("preactions", f"DELETE FROM {sf_table} WHERE AS_OF_DATE = '{bd}'")
+.mode("append")
+```
+
+- The connector runs the `DELETE` in the same session before loading, so a republish
+  replaces the date instead of duplicating it.
+
+**Proof**: 2026-11-06 ran twice and 2026-11-09 three times, with identical results
+(21,275 trades = 21,275 distinct IDs, bronze 21,284 rows not doubled, 11,515 positions,
+the same 5 recon breaks, Snowflake counts equal to Hive).
+
 ### Rerun 1: the same business date ran twice (idempotency proven by accident)
 
 - **What happened**: when I unpaused the DAG, Airflow created the **scheduled** run for
